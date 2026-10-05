@@ -103,7 +103,7 @@ The internals module provides a rich command interface:
 - `setcirc <mm>` - Set wheel circumference (1500-3000mm)
 - `setratio <ratio>` - Set gear ratio (0.3-5.0)
 - `setfly <kg> <diameter_cm> <factor> <ratio>` - Flywheel mass, diameter, inertia factor (0.5 solid disc to ~0.8 rim-weighted) and flywheel revs per crank rev
-- `spindown` - Measure the brake at the current knob position: pedal past 80 rpm, take your feet off, let the cranks coast to a stop
+- `spindown` - Measure the brake at the current knob position: pedal past 80 rpm, take your feet off, let the cranks coast to a stop. Easier from the Birota app (Settings → Calibrate power), which counts you down and tells the bike the exact moment you let go
 - `showpower` / `setbrake <pct> <friction_Nm> <magnetic_Nms>` / `clearpower` - Inspect, set by hand or reset the brake model
 - `help` - Show all commands
 
@@ -149,6 +149,7 @@ This is a personal project exploring the intersection of hardware, fitness, and 
 
 ## 📝 Technical Notes
 
+- **Calibration service** (BLE, custom): `4b3c0001-8e1f-4f9a-b6d2-6a7c2d1e0a10` with Control `…0002` (write: 0x01 start spin-down now, 0x02 cancel, 0x03 reset brake model), Status `…0003` (notify, 16 bytes: state, reason, knob %, stored point %, friction Nm, magnetic Nm·s, fit rms rpm as float32 LE) and Model `…0004` (read: 11 × {friction, magnetic, measured} then flywheel mass, radius, inertia factor, ratio)
 - **Power Calculation**: Crank torque = I·α + friction(knob) + magnetic(knob)·ω, with I the flywheel inertia seen at the crank. Spin-downs measure friction and magnetic torque in absolute units; do one at several knob positions (e.g. 0, 30, 60, 90 %). The model lives in `internals/lib/PowerModel` and is unit-tested on the host with `pio test -e native`
 - **Calibration**: 3-point system automatically handles different resistance mechanisms
 - **BLE Protocol**: Standard FTMS ensures compatibility with existing fitness apps

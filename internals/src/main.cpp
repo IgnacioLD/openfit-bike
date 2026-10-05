@@ -8,6 +8,13 @@
 #include "esp_timer.h"
 #include "power_model.h"
 
+/* ===================== BLE UUIDs ===================== */
+// Birota calibration service; mirrored in the app's BleConstants.
+#define CAL_SERVICE_UUID "4b3c0001-8e1f-4f9a-b6d2-6a7c2d1e0a10"
+#define CAL_CONTROL_UUID "4b3c0002-8e1f-4f9a-b6d2-6a7c2d1e0a10"
+#define CAL_STATUS_UUID  "4b3c0003-8e1f-4f9a-b6d2-6a7c2d1e0a10"
+#define CAL_MODEL_UUID   "4b3c0004-8e1f-4f9a-b6d2-6a7c2d1e0a10"
+
 /* ===================== Pins & Names ===================== */
 #define DEVICE_NAME "LibrePulse Bike"
 static const int MAGNET_SENSOR_PIN = 27;  // avoid strapping pins like GPIO12
@@ -120,23 +127,34 @@ String readLine() {
   return s;
 }
 
+static void savePrefs();
+
+// Missing keys keep their defaults. Floats and blobs are read only when
+// present: the Preferences library logs an error for every missing one.
+static float prefFloat(const char* key, float fallback) {
+  return prefs.isKey(key) ? prefs.getFloat(key, fallback) : fallback;
+}
+
 static void loadPrefs() {
-  prefs.begin("bike", true);
+  // Read-write so the namespace is created on first boot (read-only fails with NOT_FOUND).
+  prefs.begin("bike", false);
   cal.adc_free         = prefs.getInt   ("adc_free",   cal.adc_free);
   cal.adc_engage       = prefs.getInt   ("adc_engage", cal.adc_engage);
   cal.adc_high         = prefs.getInt   ("adc_high",   cal.adc_high);
   cal.invert           = prefs.getBool  ("invert",     cal.invert);
   cal.deadzone_pct     = prefs.getUChar ("dz",         cal.deadzone_pct);
   cal.wheel_circ_mm    = prefs.getInt   ("circ_mm",    cal.wheel_circ_mm);
-  cal.gear_ratio       = prefs.getFloat ("ratio",      cal.gear_ratio);
-  cal.speed_res_factor = prefs.getFloat ("srf",        cal.speed_res_factor);
-  cal.fly.mass_kg        = prefs.getFloat ("fly_m",      cal.fly.mass_kg);
-  cal.fly.radius_m       = prefs.getFloat ("fly_r",      cal.fly.radius_m);
-  cal.fly.inertia_factor = prefs.getFloat ("fly_k",      cal.fly.inertia_factor);
-  cal.fly.ratio          = prefs.getFloat ("fly_g",      cal.fly.ratio);
+  cal.gear_ratio       = prefFloat("ratio", cal.gear_ratio);
+  cal.speed_res_factor = prefFloat("srf",   cal.speed_res_factor);
+  cal.fly.mass_kg        = prefFloat("fly_m", cal.fly.mass_kg);
+  cal.fly.radius_m       = prefFloat("fly_r", cal.fly.radius_m);
+  cal.fly.inertia_factor = prefFloat("fly_k", cal.fly.inertia_factor);
+  cal.fly.ratio          = prefFloat("fly_g", cal.fly.ratio);
   defaultBrake(cal.brake);
-  if (prefs.getBytes("brake", &cal.brake, sizeof(cal.brake)) != sizeof(cal.brake)) defaultBrake(cal.brake);
+  bool hasBrake = prefs.isKey("brake");
+  if (hasBrake && prefs.getBytes("brake", &cal.brake, sizeof(cal.brake)) != sizeof(cal.brake)) defaultBrake(cal.brake);
   prefs.end();
+  if (!hasBrake) savePrefs();  // first boot of this firmware: store the defaults
 }
 
 static void savePrefs() {
@@ -224,39 +242,109 @@ static inline float speedPerCadence_kmh() {
 enum class SpindownState { Idle, Armed, Recording };
 static SpindownState spindownState = SpindownState::Idle;
 static const float SPINDOWN_ARM_RPM = 80.0f;
-static const int SPINDOWN_MAX = 240;
-static double spindownT[SPINDOWN_MAX];
-static float spindownW[SPINDOWN_MAX];
+static const float SPINDOWN_MIN_START_RPM = 60.0f;
+static const float SPINDOWN_MIN_RPM = 20.0f;  // below this, stiction: stop using data
+static const int SPINDOWN_MAX = 400;
+static double spindownPulses[SPINDOWN_MAX];
 static int spindownN = 0;
 static int spindownResistance = 0;
+static double spindownRelease = -1.0;  // known release time (s), or -1 when started from serial
 static uint32_t spindownStartMs = 0;
 
-static void startSpindown() {
-  spindownState = SpindownState::Armed;
+// Calibration status, notified to the app (16 bytes, fits the default MTU):
+//   [0] state  [1] reason  [2] knob % at start  [3] stored point %
+//   [4..7] friction Nm  [8..11] magnetic Nm*s/rad  [12..15] fit rms rpm (float32 LE)
+enum CalState : uint8_t { CAL_IDLE = 0, CAL_RECORDING = 1, CAL_DONE = 2, CAL_FAILED = 3 };
+enum CalReason : uint8_t {
+  CAL_OK = 0, CAL_TOO_SLOW = 1, CAL_NOISY = 2, CAL_KNOB_MOVED = 3, CAL_TIMEOUT = 4, CAL_CANCELLED = 5,
+};
+BLECharacteristic* pCalStatusCharacteristic = nullptr;
+BLECharacteristic* pCalModelCharacteristic = nullptr;
+
+static void publishCalStatus(uint8_t state, uint8_t reason, int knob, int stored = 0,
+                             float friction = 0, float magnetic = 0, float rms = 0) {
+  if (!pCalStatusCharacteristic) return;
+  uint8_t data[16];
+  data[0] = state; data[1] = reason; data[2] = (uint8_t)knob; data[3] = (uint8_t)stored;
+  memcpy(data + 4, &friction, 4);
+  memcpy(data + 8, &magnetic, 4);
+  memcpy(data + 12, &rms, 4);
+  pCalStatusCharacteristic->setValue(data, sizeof(data));
+  if (deviceConnected) pCalStatusCharacteristic->notify();
+}
+
+// Model, readable by the app: 11 x {friction f32, magnetic f32, measured u8}
+// then the flywheel {mass, radius, inertia factor, ratio} as f32.
+static void publishModel() {
+  if (!pCalModelCharacteristic) return;
+  uint8_t data[power::kLutPoints * 9 + 16];
+  int o = 0;
+  for (int i = 0; i < power::kLutPoints; ++i) {
+    memcpy(data + o, &cal.brake.friction_nm[i], 4); o += 4;
+    memcpy(data + o, &cal.brake.magnetic_nms[i], 4); o += 4;
+    data[o++] = cal.brake.measured[i] ? 1 : 0;
+  }
+  float fly[4] = {cal.fly.mass_kg, cal.fly.radius_m, cal.fly.inertia_factor, cal.fly.ratio};
+  memcpy(data + o, fly, sizeof(fly)); o += sizeof(fly);
+  pCalModelCharacteristic->setValue(data, o);
+}
+
+static void failSpindown(uint8_t reason, const char* message) {
+  spindownState = SpindownState::Idle;
+  Serial.println(message);
+  publishCalStatus(CAL_FAILED, reason, spindownResistance);
+}
+
+static void beginRecording(double releaseTime) {
+  spindownState = SpindownState::Recording;
+  spindownResistance = resistance_pct;
+  spindownRelease = releaseTime;
   spindownN = 0;
+  spindownStartMs = millis();
+  publishCalStatus(CAL_RECORDING, CAL_OK, spindownResistance);
+}
+
+/** Serial flow: waits for the rider to pass SPINDOWN_ARM_RPM, then records. */
+static void armSpindown() {
+  spindownState = SpindownState::Armed;
   spindownStartMs = millis();
   Serial.println("\n=== Spin-down ===");
   Serial.printf("Knob at %d%%. Pedal up past %.0f rpm, then take your feet off the pedals\n", resistance_pct, SPINDOWN_ARM_RPM);
   Serial.println("and let them coast to a stop. Keep clear of the spinning cranks. Type 'cancel' to abort.");
+  Serial.println("Easier: use Calibrate power in the Birota app, which counts you down.");
+}
+
+/** App flow: the rider has just taken their feet off; record from now. */
+static void startSpindownNow() {
+  if (powerEstimator.rpm() < SPINDOWN_MIN_START_RPM) {
+    spindownResistance = resistance_pct;
+    failSpindown(CAL_TOO_SLOW, "Spin-down: too slow at release.");
+    return;
+  }
+  beginRecording(esp_timer_get_time() / 1e6);
+  Serial.printf("Spin-down started from the app at %.0f rpm, knob %d%%.\n", powerEstimator.rpm(), spindownResistance);
+}
+
+static void cancelSpindown() {
+  if (spindownState == SpindownState::Idle) return;
+  failSpindown(CAL_CANCELLED, "Spin-down cancelled.");
 }
 
 static void finishSpindown() {
   spindownState = SpindownState::Idle;
-  // Skip the first revolution after the peak: the rider may still be easing off.
-  int peak = 0;
-  for (int i = 1; i < spindownN; ++i) if (spindownW[i] > spindownW[peak]) peak = i;
-  int from = peak + MAGNETS_PER_REV;
-  power::SpindownFit fit = from < spindownN
-      ? power::fitSpindown(spindownT + from, spindownW + from, spindownN - from, 20.0f * power::kTwoPi / 60.0f, MAGNETS_PER_REV)
-      : power::SpindownFit{};
-  if (!fit.ok || fit.r2 < 0.9f) {
-    Serial.printf("Spin-down not usable (%d points, r2=%.3f). Spin faster before letting go and keep your feet off.\n",
-        fit.points, fit.r2);
+  power::SpindownFit fit = power::fitSpindown(spindownPulses, spindownN, MAGNETS_PER_REV,
+      SPINDOWN_MIN_RPM * power::kTwoPi / 60.0f, spindownRelease);
+  if (!fit.ok || fit.r2 < 0.95f || fit.rms_rpm > 3.0f) {
+    Serial.printf("Spin-down not usable (%d windows, r2=%.3f, rms=%.1f rpm). Spin faster before letting go and keep your feet off.\n",
+        fit.points, fit.r2, fit.rms_rpm);
+    publishCalStatus(CAL_FAILED, CAL_NOISY, spindownResistance, 0, 0, 0, fit.rms_rpm);
     return;
   }
   if (abs(resistance_pct - spindownResistance) > 5) {
-    Serial.printf("The knob moved during the spin-down (%d%% -> %d%%). Try again without touching it.\n",
+    char msg[96];
+    snprintf(msg, sizeof(msg), "The knob moved during the spin-down (%d%% -> %d%%). Try again without touching it.",
         spindownResistance, resistance_pct);
+    failSpindown(CAL_KNOB_MOVED, msg);
     return;
   }
   float inertia = power::crankInertia(cal.fly);
@@ -268,24 +356,22 @@ static void finishSpindown() {
   cal.brake.magnetic_nms[idx] = magnetic;
   cal.brake.measured[idx] = true;
   savePrefs();
+  publishModel();
+  publishCalStatus(CAL_DONE, CAL_OK, spindownResistance, idx * 10, friction, magnetic, fit.rms_rpm);
   float w90 = 90.0f * power::kTwoPi / 60.0f;
-  Serial.printf("Knob %d%% (stored at %d%%): friction %.2f Nm + magnetic %.3f Nm*s/rad (%d points, r2=%.3f)\n",
-      spindownResistance, idx * 10, friction, magnetic, fit.points, fit.r2);
+  Serial.printf("Knob %d%% (stored at %d%%): friction %.2f Nm + magnetic %.3f Nm*s/rad (%d windows, r2=%.3f, rms=%.1f rpm)\n",
+      spindownResistance, idx * 10, friction, magnetic, fit.points, fit.r2, fit.rms_rpm);
   Serial.printf("  -> holding 90 rpm here takes %.0f W. Repeat at other knob positions.\n", (friction + magnetic * w90) * w90);
   printPowerModel();
 }
 
-static void onSpeedSample() {
+static void onPulseForSpindown(double t) {
   if (spindownState == SpindownState::Armed && powerEstimator.rpm() >= SPINDOWN_ARM_RPM) {
-    spindownState = SpindownState::Recording;
-    spindownResistance = resistance_pct;
-    spindownN = 0;
+    beginRecording(-1.0);
     Serial.println("Recording. Feet off now and let it coast.");
   }
   if (spindownState == SpindownState::Recording && spindownN < SPINDOWN_MAX) {
-    spindownT[spindownN] = powerEstimator.omegaTime();
-    spindownW[spindownN] = powerEstimator.omega();
-    ++spindownN;
+    spindownPulses[spindownN++] = t;
   }
 }
 
@@ -295,8 +381,34 @@ static void updateSpindown() {
   if (spindownState == SpindownState::Recording && (stopped || spindownN >= SPINDOWN_MAX)) {
     finishSpindown();
   } else if (millis() - spindownStartMs > 120000) {
-    spindownState = SpindownState::Idle;
-    Serial.println("Spin-down timed out.");
+    failSpindown(CAL_TIMEOUT, "Spin-down timed out.");
+  }
+}
+
+// Commands written by the app, run from loop() rather than the BLE task.
+static volatile uint8_t pendingCalCommand = 0;
+
+class CalControlCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic* c) override {
+    std::string v = c->getValue();
+    if (!v.empty()) pendingCalCommand = (uint8_t)v[0];
+  }
+};
+
+static void handleCalCommand() {
+  uint8_t cmd = pendingCalCommand;
+  if (!cmd) return;
+  pendingCalCommand = 0;
+  switch (cmd) {
+    case 0x01: startSpindownNow(); break;
+    case 0x02: cancelSpindown(); break;
+    case 0x03:
+      defaultBrake(cal.brake);
+      savePrefs();
+      publishModel();
+      Serial.println("Brake model reset from the app.");
+      break;
+    default: break;
   }
 }
 
@@ -312,7 +424,9 @@ void updatePower() {
     int64_t us = pulseRing[consumed % PULSE_RING];
     interrupts();
     ++consumed;
-    if (powerEstimator.onPulse(us / 1e6, (float)resistance_pct, cal.fly, cal.brake)) onSpeedSample();
+    double t = us / 1e6;
+    powerEstimator.onPulse(t, (float)resistance_pct, cal.fly, cal.brake);
+    onPulseForSpindown(t);
   }
   powerEstimator.onTick(esp_timer_get_time() / 1e6);
   float rpm = powerEstimator.cadenceRpm();
@@ -501,15 +615,16 @@ void handleCommand(const String& cmdLine) {
     } else { Serial.printf("Current speed_res_factor: %.2f\nUsage: setspeedres 0.3\n", cal.speed_res_factor); }
     return;
   }
-  if (cmdLine.equalsIgnoreCase("spindown")) { startSpindown(); return; }
-  if (cmdLine.equalsIgnoreCase("cancel")) { spindownState = SpindownState::Idle; Serial.println("Spin-down cancelled."); return; }
+  if (cmdLine.equalsIgnoreCase("spindown")) { armSpindown(); return; }
+  if (cmdLine.equalsIgnoreCase("cancel")) { cancelSpindown(); return; }
   if (cmdLine.equalsIgnoreCase("showpower")) { printPowerModel(); return; }
-  if (cmdLine.equalsIgnoreCase("clearpower")) { defaultBrake(cal.brake); savePrefs(); Serial.println("Brake model reset to defaults."); return; }
+  if (cmdLine.equalsIgnoreCase("clearpower")) { defaultBrake(cal.brake); savePrefs(); publishModel(); Serial.println("Brake model reset to defaults."); return; }
   if (cmdLine.startsWith("setfly")) {
     float m, d, k, g;
     if (sscanf(cmdLine.c_str(), "setfly %f %f %f %f", &m, &d, &k, &g) == 4 && m > 0 && d > 0 && k > 0 && k <= 1.0f && g > 0) {
       cal.fly.mass_kg = m; cal.fly.radius_m = d / 200.0f; cal.fly.inertia_factor = k; cal.fly.ratio = g;
       savePrefs();
+      publishModel();
       printPowerModel();
     } else {
       Serial.println("Usage: setfly <kg> <diameter_cm> <factor 0.5..1> <ratio>, e.g. setfly 6.5 40 0.8 6.25");
@@ -522,6 +637,7 @@ void handleCommand(const String& cmdLine) {
       int idx = (pct + 5) / 10;
       cal.brake.friction_nm[idx] = f; cal.brake.magnetic_nms[idx] = mg; cal.brake.measured[idx] = true;
       savePrefs();
+      publishModel();
       printPowerModel();
     } else {
       Serial.println("Usage: setbrake <pct 0..100> <friction_Nm> <magnetic_Nms>");
@@ -579,6 +695,26 @@ void setup() {
   pCscFeature->setValue(cscFeature, sizeof(cscFeature));
   pCscService->start();
 
+  // Birota calibration service (custom): control (write), status (notify), model (read).
+  BLEService* pCalService = pServer->createService(BLEUUID(CAL_SERVICE_UUID));
+  BLECharacteristic* pCalControl = pCalService->createCharacteristic(
+    BLEUUID(CAL_CONTROL_UUID),
+    BLECharacteristic::PROPERTY_WRITE
+  );
+  pCalControl->setCallbacks(new CalControlCallbacks());
+  pCalStatusCharacteristic = pCalService->createCharacteristic(
+    BLEUUID(CAL_STATUS_UUID),
+    BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY
+  );
+  pCalStatusCharacteristic->addDescriptor(new BLE2902());
+  pCalModelCharacteristic = pCalService->createCharacteristic(
+    BLEUUID(CAL_MODEL_UUID),
+    BLECharacteristic::PROPERTY_READ
+  );
+  pCalService->start();
+  publishCalStatus(CAL_IDLE, CAL_OK, resistance_pct);
+  publishModel();
+
   BLEAdvertising* adv = BLEDevice::getAdvertising();
   adv->addServiceUUID((uint16_t)0x1826);
   adv->addServiceUUID((uint16_t)0x1816);
@@ -595,6 +731,7 @@ void loop() {
     handleCommand(cmd);
   }
 
+  handleCalCommand();
   updateMetrics();
   sendBLEData();
   sendCSCData();

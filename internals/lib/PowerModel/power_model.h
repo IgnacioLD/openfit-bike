@@ -97,6 +97,7 @@ class PowerEstimator {
     if (count_ > 0 && t - times_[(head_ + kRing - 1) % kRing] > kGapSec) reset();
     times_[head_] = t;
     head_ = (head_ + 1) % kRing;
+    ++pulses_;
     if (count_ < kRing) ++count_;
     if (count_ < ppr_ + 1) return false;
 
@@ -135,6 +136,8 @@ class PowerEstimator {
   float omega() const { return hasSpeed_ ? omega_ : 0.0f; }
   /** Time the latest speed refers to (middle of its revolution), seconds. */
   double omegaTime() const { return mid_; }
+  /** Crank angle travelled since the last reset at that time, radians (from the pulse count). */
+  double omegaAngle() const { return (pulses_ - ppr_ / 2.0) * kTwoPi / ppr_; }
   float rpm() const { return omega() * 60.0f / kTwoPi; }
   float cadenceRpm() const { return hasCadence_ ? cadence_ : 0.0f; }
   float powerW() const { return power_; }
@@ -142,6 +145,7 @@ class PowerEstimator {
   void reset() {
     count_ = 0;
     head_ = 0;
+    pulses_ = 0;
     hasSpeed_ = hasAlpha_ = hasCadence_ = false;
     omega_ = alpha_ = cadence_ = power_ = 0.0f;
   }
@@ -158,6 +162,7 @@ class PowerEstimator {
   double times_[kRing] = {0};
   int head_ = 0;
   int count_ = 0;
+  long pulses_ = 0;
   bool hasSpeed_ = false, hasAlpha_ = false, hasCadence_ = false;
   float omega_ = 0.0f, alpha_ = 0.0f, cadence_ = 0.0f, power_ = 0.0f;
   double mid_ = 0.0;
@@ -166,59 +171,123 @@ class PowerEstimator {
 struct SpindownFit {
   bool ok = false;
   int points = 0;
-  float decel_const = 0.0f;   // a in -alpha = a + b * omega, rad/s^2
+  float decel_const = 0.0f;      // a in -alpha = a + b * omega, rad/s^2
   float decel_per_omega = 0.0f;  // b, 1/s
-  float r2 = 0.0f;
+  float r2 = 0.0f;               // of the speed fit
+  float rms_rpm = 0.0f;          // residual of the speed fit
   float omega_max = 0.0f;
   float omega_min = 0.0f;
 };
 
 /**
- * Fits -alpha = a + b * omega to a spin-down from full-revolution speed
- * samples [w] (rad/s, each the mean speed over one revolution, as from
- * PowerEstimator) at the revolutions' mid times [t] (s), taken every
- * 1/pulsesPerRev revolution. Uses the samples after the peak speed whose
- * speed is at least [minOmega].
+ * Fits a spin-down straight from the magnet pulse times [pulses] (seconds,
+ * consecutive, no rider torque from the release on).
  *
- * Integrating the motion over two revolution windows one revolution apart
- * gives, exactly up to second-order terms,
- *     -(w[i+1] - w[i-1]) / (t[i+1] - t[i-1]) = a + b * 2*pi / (t[i+1] - t[i-1])
- * so the regressor is the mean speed between the windows, not w[i]; using
- * w[i] biases the fit when only a few revolutions are available.
+ * With no rider torque -alpha = a + b * omega. Integrated, the speed is
+ * omega(t) = c - a * t - b * theta(t), linear in (c, a, b) and free of
+ * differentiation, so it stays stable with the few revolutions a heavily
+ * braked flywheel coasts. Each window between consecutive pulses gives its
+ * mean speed (window angle / duration) at its mid time and its time-averaged
+ * angle; for a decelerating crank the latter sits alpha * T^2 / 12 past the
+ * window's middle angle, a correction refined over a few iterations.
+ *
+ * With two magnets, every half revolution is a window, and the magnets'
+ * deviation from 180 degrees is fitted as one more unknown (it alternates
+ * the window angle by +-eps), which doubles the data compared with full
+ * revolutions. Only windows after the peak speed and after [releaseTime]
+ * (when known, in the pulses' clock), while faster than [minOmega], are used: below that, stiction makes friction non-constant.
  */
-inline SpindownFit fitSpindown(const double* t, const float* w, int n, float minOmega, int pulsesPerRev = 2) {
+inline SpindownFit fitSpindown(const double* pulses, int n, int pulsesPerRev, float minOmega, double releaseTime = -1.0) {
   SpindownFit fit;
-  if (n < 5) return fit;
-  int peak = 0;
-  for (int i = 1; i < n; ++i) if (w[i] > w[peak]) peak = i;
+  const bool halfWindows = pulsesPerRev == 2;
+  const int span = halfWindows ? 1 : pulsesPerRev;    // pulses per window
+  const double angle = kTwoPi * span / pulsesPerRev;  // nominal window angle
+  const int windows = n - span;
+  if (windows < 6) return fit;
 
-  double sx = 0, sy = 0, sxx = 0, sxy = 0, syy = 0;
-  int m = 0;
-  float wMin = w[peak];
-  const int step = pulsesPerRev;  // samples per revolution: windows one revolution apart
-  for (int i = peak; i + step < n; ++i) {
-    if (w[i + step] < minOmega) break;
-    double dt = t[i + step] - t[i];
-    if (dt <= 0) continue;
-    double x = kTwoPi / dt;
-    double y = -(w[i + step] - w[i]) / dt;
-    sx += x; sy += y; sxx += x * x; sxy += x * y; syy += y * y;
-    ++m;
-    if (w[i] < wMin) wMin = w[i];
+  constexpr int kMaxWindows = 512;
+  static double tm[kMaxWindows], period[kMaxWindows], th[kMaxWindows], speed[kMaxWindows];
+  static int sign[kMaxWindows];
+  int count = windows < kMaxWindows ? windows : kMaxWindows;
+  for (int k = 0; k < count; ++k) {
+    period[k] = pulses[k + span] - pulses[k];
+    tm[k] = (pulses[k + span] + pulses[k]) / 2.0;
+    th[k] = k * kTwoPi / pulsesPerRev + angle / 2.0;
+    speed[k] = period[k] > 0 ? angle / period[k] : 0.0;
+    sign[k] = halfWindows ? ((k % 2 == 0) ? 1 : -1) : 0;
   }
+  // Peak of the speed (pairs averaged so the magnet offset does not pick it).
+  int peak = 0;
+  double best = -1;
+  for (int k = 0; k + 1 < count; ++k) {
+    double v = (speed[k] + speed[k + 1]) / 2.0;
+    if (v > best) { best = v; peak = k; }
+  }
+  // Rider torque must be gone from every window used. With a known release
+  // time, start at the first window that begins after it; otherwise skip the
+  // window holding the peak, which may still carry some.
+  int start = peak + 1;
+  if (releaseTime >= 0) {
+    start = peak;
+    while (start < count && pulses[start] < releaseTime) ++start;
+  }
+  int end = start;
+  while (end < count && speed[end] >= minOmega) ++end;
+  int m = end - start;
   fit.points = m;
-  if (m < 5) return fit;
-  double varX = sxx - sx * sx / m;
-  double varY = syy - sy * sy / m;
-  double cov = sxy - sx * sy / m;
-  if (varX <= 1e-9) return fit;
-  double b = cov / varX;
-  double a = (sy - b * sx) / m;
-  fit.decel_per_omega = (float)b;
+  if (m < 6) return fit;
+  peak = start;
+
+  const int P = halfWindows ? 4 : 3;  // c, -a, -b [, -eps]
+  double coef[4] = {0, 0, 0, 0};
+  double a = 0, b = 0;
+  for (int iter = 0; iter < 4; ++iter) {
+    double S[4][5] = {{0}};
+    for (int k = peak; k < end; ++k) {
+      double alpha = a + b * speed[k];
+      double thBar = th[k] + alpha * period[k] * period[k] / 12.0;
+      double x[4] = {1.0, tm[k] - tm[peak], thBar - th[peak], -sign[k] / period[k]};
+      for (int r = 0; r < P; ++r) {
+        for (int c = 0; c < P; ++c) S[r][c] += x[r] * x[c];
+        S[r][P] += x[r] * speed[k];
+      }
+    }
+    // Gaussian elimination with partial pivoting.
+    for (int col = 0; col < P; ++col) {
+      int piv = col;
+      for (int r = col + 1; r < P; ++r) if (fabs(S[r][col]) > fabs(S[piv][col])) piv = r;
+      if (fabs(S[piv][col]) < 1e-12) return fit;
+      for (int c = 0; c <= P; ++c) { double tmp = S[col][c]; S[col][c] = S[piv][c]; S[piv][c] = tmp; }
+      for (int r = 0; r < P; ++r) {
+        if (r == col) continue;
+        double f = S[r][col] / S[col][col];
+        for (int c = col; c <= P; ++c) S[r][c] -= f * S[col][c];
+      }
+    }
+    for (int r = 0; r < P; ++r) coef[r] = S[r][P] / S[r][r];
+    a = -coef[1];
+    b = -coef[2];
+  }
+
+  double mean = 0;
+  for (int k = peak; k < end; ++k) mean += speed[k];
+  mean /= m;
+  double ssRes = 0, ssTot = 0, wMin = speed[peak], wMax = speed[peak];
+  for (int k = peak; k < end; ++k) {
+    double alpha = a + b * speed[k];
+    double thBar = th[k] + alpha * period[k] * period[k] / 12.0;
+    double pred = coef[0] + coef[1] * (tm[k] - tm[peak]) + coef[2] * (thBar - th[peak]) - coef[3] * sign[k] / period[k];
+    ssRes += (speed[k] - pred) * (speed[k] - pred);
+    ssTot += (speed[k] - mean) * (speed[k] - mean);
+    if (speed[k] < wMin) wMin = speed[k];
+    if (speed[k] > wMax) wMax = speed[k];
+  }
   fit.decel_const = (float)a;
-  fit.r2 = varY > 1e-12 ? (float)(cov * cov / (varX * varY)) : 0.0f;
-  fit.omega_max = w[peak];
-  fit.omega_min = wMin;
+  fit.decel_per_omega = (float)b;
+  fit.r2 = ssTot > 1e-12 ? (float)(1.0 - ssRes / ssTot) : 0.0f;
+  fit.rms_rpm = (float)(sqrt(ssRes / m) * 60.0 / kTwoPi);
+  fit.omega_max = (float)wMax;
+  fit.omega_min = (float)wMin;
   fit.ok = true;
   return fit;
 }

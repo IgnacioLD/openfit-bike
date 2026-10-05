@@ -110,25 +110,57 @@ void test_acceleration_adds_the_flywheel_inertia() {
   TEST_ASSERT_TRUE(est.powerW() > (10.0 + 0.5 * om) * om * 1.3);
 }
 
+/** Fits the spin-down from [pulses], optionally jittered by up to [jitterSec]. */
+static SpindownFit fitPulses(std::vector<double> pulses, double jitterSec = 0, double releaseTime = 0) {
+  unsigned seed = 7;
+  if (jitterSec > 0) {
+    for (double& p : pulses) {
+      seed = seed * 1103515245u + 12345u;
+      p += jitterSec * (((seed >> 8) % 2001) / 1000.0 - 1.0);
+    }
+  }
+  return fitSpindown(pulses.data(), (int)pulses.size(), 2, 20 * 2 * M_PI / 60, releaseTime);
+}
+
 void test_spindown_fit_recovers_friction_and_magnetic_brake() {
   Sim sim;
   sim.curve = flatCurve(9.0f, 1.2f);
   sim.run(25, 110 * 2 * M_PI / 60, [](double, double) { return 0.0; }, {0, M_PI});
-  PowerEstimator est(2);
-  std::vector<double> t;
-  std::vector<float> w;
-  for (double p : sim.pulses) {
-    if (est.onPulse(p, 50, sim.fly, sim.curve)) {
-      t.push_back(est.omegaTime());
-      w.push_back(est.omega());
-    }
-  }
-  SpindownFit fit = fitSpindown(t.data(), w.data(), (int)t.size(), 20 * 2 * M_PI / 60);
+  SpindownFit fit = fitPulses(sim.pulses);
   TEST_ASSERT_TRUE(fit.ok);
   float I = crankInertia(sim.fly);
-  TEST_ASSERT_FLOAT_WITHIN(0.5f, 9.0f, fit.decel_const * I);
-  TEST_ASSERT_FLOAT_WITHIN(0.1f, 1.2f, fit.decel_per_omega * I);
-  TEST_ASSERT_TRUE(fit.r2 > 0.98f);
+  TEST_ASSERT_FLOAT_WITHIN(0.3f, 9.0f, fit.decel_const * I);
+  TEST_ASSERT_FLOAT_WITHIN(0.06f, 1.2f, fit.decel_per_omega * I);
+  TEST_ASSERT_TRUE(fit.r2 > 0.999f);
+}
+
+void test_spindown_fit_survives_a_heavy_brake_with_few_revolutions() {
+  // Like the real bike at mid knob: ~22 Nm stops it from 113 rpm in a few
+  // revolutions. Uneven magnets and 1 ms timing jitter on every pulse.
+  Sim sim;
+  sim.curve = flatCurve(22.0f, 0.3f);
+  sim.run(10, 113 * 2 * M_PI / 60, [](double, double) { return 0.0; }, {0, 170 * M_PI / 180});
+  SpindownFit fit = fitPulses(sim.pulses, 0.001);
+  TEST_ASSERT_TRUE(fit.ok);
+  float I = crankInertia(sim.fly);
+  float watts90 = (fit.decel_const + fit.decel_per_omega * 9.42f) * I * 9.42f;
+  float trueWatts90 = (22.0f + 0.3f * 9.42f) * 9.42f;
+  TEST_ASSERT_FLOAT_WITHIN(trueWatts90 * 0.05f, trueWatts90, watts90);
+}
+
+void test_spindown_fit_ignores_pedaling_before_the_release() {
+  // The rider keeps pushing for a second after the command, then lets go.
+  Sim sim;
+  sim.curve = flatCurve(12.0f, 0.6f);
+  sim.run(12, 100 * 2 * M_PI / 60, [](double t, double om) { return t < 1.0 ? 40.0 : 0.0; }, {0, M_PI});
+  // Known release (the app's countdown) and unknown release (serial command).
+  SpindownFit fit = fitPulses(sim.pulses, 0, 1.0);
+  TEST_ASSERT_TRUE(fit.ok);
+  TEST_ASSERT_FLOAT_WITHIN(0.3f, 12.0f, fit.decel_const * crankInertia(sim.fly));
+  fit = fitPulses(sim.pulses, 0, -1.0);
+  TEST_ASSERT_TRUE(fit.ok);
+  float I = crankInertia(sim.fly);
+  TEST_ASSERT_FLOAT_WITHIN(0.8f, 12.0f, fit.decel_const * I);
 }
 
 void test_resistance_interpolates_only_between_measured_points() {
@@ -163,6 +195,8 @@ int main(int, char**) {
   RUN_TEST(test_uneven_magnets_do_not_ripple_cadence_or_power);
   RUN_TEST(test_acceleration_adds_the_flywheel_inertia);
   RUN_TEST(test_spindown_fit_recovers_friction_and_magnetic_brake);
+  RUN_TEST(test_spindown_fit_survives_a_heavy_brake_with_few_revolutions);
+  RUN_TEST(test_spindown_fit_ignores_pedaling_before_the_release);
   RUN_TEST(test_resistance_interpolates_only_between_measured_points);
   RUN_TEST(test_stopping_resets_to_zero);
   return UNITY_END();
