@@ -177,6 +177,15 @@ void test_resistance_interpolates_only_between_measured_points() {
   TEST_ASSERT_FLOAT_WITHIN(1e-4, 4.0f, f);
 }
 
+void test_changing_the_flywheel_rescales_only_measured_points() {
+  ResistanceCurve c = flatCurve(10.0f, 1.0f);
+  c.measured[3] = true;
+  rescaleMeasured(c, 8.0f, 4.0f);
+  TEST_ASSERT_EQUAL_FLOAT(5.0f, c.friction_nm[3]);
+  TEST_ASSERT_EQUAL_FLOAT(0.5f, c.magnetic_nms[3]);
+  TEST_ASSERT_EQUAL_FLOAT(10.0f, c.friction_nm[4]);  // default guess, not a measurement
+}
+
 void test_stopping_resets_to_zero() {
   Flywheel fly;
   ResistanceCurve c = flatCurve(10, 0.5);
@@ -198,6 +207,7 @@ int main(int, char**) {
   RUN_TEST(test_spindown_fit_survives_a_heavy_brake_with_few_revolutions);
   RUN_TEST(test_spindown_fit_ignores_pedaling_before_the_release);
   RUN_TEST(test_resistance_interpolates_only_between_measured_points);
+  RUN_TEST(test_changing_the_flywheel_rescales_only_measured_points);
   RUN_TEST(test_stopping_resets_to_zero);
   return UNITY_END();
 }

@@ -622,7 +622,10 @@ void handleCommand(const String& cmdLine) {
   if (cmdLine.startsWith("setfly")) {
     float m, d, k, g;
     if (sscanf(cmdLine.c_str(), "setfly %f %f %f %f", &m, &d, &k, &g) == 4 && m > 0 && d > 0 && k > 0 && k <= 1.0f && g > 0) {
+      float oldInertia = power::crankInertia(cal.fly);
       cal.fly.mass_kg = m; cal.fly.radius_m = d / 200.0f; cal.fly.inertia_factor = k; cal.fly.ratio = g;
+      // Measured brake points are deceleration x inertia: keep them consistent.
+      power::rescaleMeasured(cal.brake, oldInertia, power::crankInertia(cal.fly));
       savePrefs();
       publishModel();
       printPowerModel();

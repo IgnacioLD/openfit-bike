@@ -79,6 +79,21 @@ inline void resistanceAt(const ResistanceCurve& c, float pct, float* friction, f
 }
 
 /**
+ * Spin-downs measure deceleration; the stored torques are that deceleration
+ * times the crank inertia at the time. When the flywheel parameters change,
+ * measured points must scale by the inertia ratio to stay consistent.
+ */
+inline void rescaleMeasured(ResistanceCurve& c, float oldInertia, float newInertia) {
+  if (oldInertia <= 0.0f || newInertia <= 0.0f) return;
+  float k = newInertia / oldInertia;
+  for (int i = 0; i < kLutPoints; ++i) {
+    if (!c.measured[i]) continue;
+    c.friction_nm[i] *= k;
+    c.magnetic_nms[i] *= k;
+  }
+}
+
+/**
  * Turns magnet pulses into cadence and power.
  *
  * Speed comes from full revolutions (pulse i vs pulse i - pulsesPerRev), so
