@@ -5,6 +5,7 @@
 #include <BLE2902.h>
 #include <Preferences.h>
 #include <math.h>
+#include "esp_timer.h"
 
 /* ===================== Pins & Names ===================== */
 #define DEVICE_NAME "LibrePulse Bike"
@@ -49,8 +50,13 @@ Preferences prefs;
 Cal cal;
 
 /* ===================== Runtime State ===================== */
-volatile uint32_t lastPulseUs = 0;
+// Times come from esp_timer_get_time(): 64-bit microseconds since boot, so
+// they never wrap. (micros() wraps every ~71.6 min, which used to break the
+// "no pulse for 3 s" check and drag cadence to 0 on long rides.)
+volatile int64_t  lastPulseUs = 0;
 volatile uint32_t lastValidIntervalUs = 0;
+volatile uint32_t pulseCount = 0;   // debounced magnet pulses since boot
+volatile int64_t  lastRevUs = 0;    // time of the pulse that completed the latest full crank rev
 
 float cadence_rpm = 0.0f;  // CRANK RPM
 float speed_kmh   = 0.0f;
@@ -62,14 +68,17 @@ bool deviceConnected = false;
 // BLE
 BLEServer*         pServer = nullptr;
 BLECharacteristic* pBikeDataCharacteristic = nullptr;
+BLECharacteristic* pCscMeasurementCharacteristic = nullptr;
 
 /* ===================== ISR ===================== */
 void IRAM_ATTR magnetISR() {
-  uint32_t now = micros();
-  uint32_t dt  = now - lastPulseUs;   // unsigned handles wrap
+  int64_t now = esp_timer_get_time();
+  int64_t dt  = now - lastPulseUs;
   if (dt >= DEBOUNCE_US) {
     lastPulseUs = now;
-    lastValidIntervalUs = dt;
+    lastValidIntervalUs = dt > (int64_t)UINT32_MAX ? UINT32_MAX : (uint32_t)dt;
+    pulseCount++;
+    if (pulseCount % MAGNETS_PER_REV == 0) lastRevUs = now;
   }
 }
 
@@ -181,12 +190,11 @@ static float lutInterp(const uint8_t* lut11, float x_pct) {
 
 /* ===================== Cadence / Resistance / Speed / Power ===================== */
 void updateCadence() {
-  static uint32_t lastSeenPulseUs = 0;
-  uint32_t nowMs = millis();
+  static int64_t lastSeenPulseUs = 0;
 
   noInterrupts();
   uint32_t intervalUs = lastValidIntervalUs;
-  uint32_t pulseUs    = lastPulseUs;
+  int64_t  pulseUs    = lastPulseUs;
   interrupts();
 
   if (intervalUs > 0 && pulseUs != 0 && pulseUs != lastSeenPulseUs) {
@@ -202,7 +210,7 @@ void updateCadence() {
   }
 
   // Decay if no pulses for ~3s
-  if ((nowMs - (lastPulseUs / 1000U)) > 3000U) {
+  if (esp_timer_get_time() - pulseUs > 3000000LL) {
     if (cadence_rpm > 0.0f) {
       cadence_rpm *= 0.95f;
       if (cadence_rpm < CADENCE_MIN) cadence_rpm = 0.0f;
@@ -293,6 +301,41 @@ void sendBLEData() {
 
   pBikeDataCharacteristic->setValue(data, sizeof(data));
   pBikeDataCharacteristic->notify();
+}
+
+/* ===================== BLE: CSC Measurement ===================== */
+// Cycling Speed and Cadence (0x1816) crank data: cumulative crank revolutions
+// and the time of the last full revolution in 1/1024 s. Unlike the FTMS
+// cadence (EMA-smoothed per half turn), this is the raw revolution timing,
+// so clients can derive exact per-revolution cadence. Notified as soon as a
+// revolution completes, plus a 1 s heartbeat so clients see the crank stop.
+static const uint32_t CSC_HEARTBEAT_MS = 1000;
+
+void sendCSCData() {
+  static uint32_t lastSentRevs = UINT32_MAX;
+  static uint32_t lastNotifyMs = 0;
+  if (!deviceConnected) return;
+
+  noInterrupts();
+  uint32_t revs  = pulseCount / MAGNETS_PER_REV;
+  int64_t  revUs = lastRevUs;
+  interrupts();
+
+  uint32_t nowMs = millis();
+  if (revs == lastSentRevs && (nowMs - lastNotifyMs) < CSC_HEARTBEAT_MS) return;
+  lastSentRevs = revs;
+  lastNotifyMs = nowMs;
+
+  const uint16_t cumRevs   = (uint16_t)(revs & 0xFFFF);
+  const uint16_t eventTime = (uint16_t)(((uint64_t)revUs * 1024ULL / 1000000ULL) & 0xFFFF);
+
+  uint8_t data[5];
+  data[0] = 0x02;  // flags: crank revolution data present
+  data[1] = cumRevs & 0xFF;   data[2] = (cumRevs >> 8) & 0xFF;
+  data[3] = eventTime & 0xFF; data[4] = (eventTime >> 8) & 0xFF;
+
+  pCscMeasurementCharacteristic->setValue(data, sizeof(data));
+  pCscMeasurementCharacteristic->notify();
 }
 
 /* ===================== BLE callbacks ===================== */
@@ -495,8 +538,24 @@ void setup() {
   pBikeDataCharacteristic->addDescriptor(new BLE2902()); // CCCD
   pService->start();
 
+  // CSC (0x1816): CSC Measurement (0x2A5B, notify) + CSC Feature (0x2A5C, read)
+  BLEService* pCscService = pServer->createService(BLEUUID((uint16_t)0x1816));
+  pCscMeasurementCharacteristic = pCscService->createCharacteristic(
+    BLEUUID((uint16_t)0x2A5B),
+    BLECharacteristic::PROPERTY_NOTIFY
+  );
+  pCscMeasurementCharacteristic->addDescriptor(new BLE2902()); // CCCD
+  BLECharacteristic* pCscFeature = pCscService->createCharacteristic(
+    BLEUUID((uint16_t)0x2A5C),
+    BLECharacteristic::PROPERTY_READ
+  );
+  uint8_t cscFeature[2] = { 0x02, 0x00 }; // crank revolution data supported
+  pCscFeature->setValue(cscFeature, sizeof(cscFeature));
+  pCscService->start();
+
   BLEAdvertising* adv = BLEDevice::getAdvertising();
   adv->addServiceUUID((uint16_t)0x1826);
+  adv->addServiceUUID((uint16_t)0x1816);
   adv->setScanResponse(true);
   BLEDevice::startAdvertising();
 
@@ -512,6 +571,7 @@ void loop() {
 
   updateMetrics();
   sendBLEData();
+  sendCSCData();
 
   // Human-readable log (2 Hz)
   static uint32_t lastPrint = 0;
