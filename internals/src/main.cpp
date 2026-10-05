@@ -6,6 +6,7 @@
 #include <Preferences.h>
 #include <math.h>
 #include "esp_timer.h"
+#include "power_model.h"
 
 /* ===================== Pins & Names ===================== */
 #define DEVICE_NAME "LibrePulse Bike"
@@ -34,17 +35,23 @@ struct Cal {
   float gear_ratio     = 2.2f;  // wheel revs per crank rev (typical mid-gear)
   float speed_res_factor = 0.0f; // optional: speed drops with resistance (0..1)
 
-  // Torque model (Nm) range. LUT outputs 0..1 which scales this range.
-  float torque_min_nm = 0.5f;
-  float torque_max_nm = 25.0f;
-
-  // Hysteresis on the LUT input (percent of resistance shift)
-  uint8_t hyst_pct = 4; // 0..10 typical
-
-  // LUT: resistance% -> torque factor% (0..100). 11 points for 0,10,...,100
-  // Default curve: soft start then ramps hard near the top (cotton-pad feel)
-  uint8_t lut11[11] = { 0, 0, 2, 6, 12, 24, 45, 65, 80, 92, 100 };
+  // Power model (see lib/PowerModel): flywheel geometry plus the brake's
+  // friction and magnetic torque per knob position, measured by `spindown`.
+  power::Flywheel fly;
+  power::ResistanceCurve brake;
 };
+
+// Uncalibrated brake: a rough felt-pad friction ramp (0.5 to 25 Nm at the
+// crank, soft start, hard near the top) and no magnetic term. Replaced point
+// by point by spin-downs.
+static void defaultBrake(power::ResistanceCurve& c) {
+  static const uint8_t ramp[power::kLutPoints] = { 0, 0, 2, 6, 12, 24, 45, 65, 80, 92, 100 };
+  for (int i = 0; i < power::kLutPoints; ++i) {
+    c.friction_nm[i] = 0.5f + 24.5f * ramp[i] / 100.0f;
+    c.magnetic_nms[i] = 0.0f;
+    c.measured[i] = false;
+  }
+}
 
 Preferences prefs;
 Cal cal;
@@ -54,9 +61,15 @@ Cal cal;
 // they never wrap. (micros() wraps every ~71.6 min, which used to break the
 // "no pulse for 3 s" check and drag cadence to 0 on long rides.)
 volatile int64_t  lastPulseUs = 0;
-volatile uint32_t lastValidIntervalUs = 0;
 volatile uint32_t pulseCount = 0;   // debounced magnet pulses since boot
 volatile int64_t  lastRevUs = 0;    // time of the pulse that completed the latest full crank rev
+
+// Every debounced pulse time, for the power model. The loop drains it far
+// faster than pulses arrive (< 10 per second).
+static const uint32_t PULSE_RING = 32;
+volatile int64_t  pulseRing[PULSE_RING];
+
+power::PowerEstimator powerEstimator(MAGNETS_PER_REV);
 
 float cadence_rpm = 0.0f;  // CRANK RPM
 float speed_kmh   = 0.0f;
@@ -76,7 +89,7 @@ void IRAM_ATTR magnetISR() {
   int64_t dt  = now - lastPulseUs;
   if (dt >= DEBOUNCE_US) {
     lastPulseUs = now;
-    lastValidIntervalUs = dt > (int64_t)UINT32_MAX ? UINT32_MAX : (uint32_t)dt;
+    pulseRing[pulseCount % PULSE_RING] = now;
     pulseCount++;
     if (pulseCount % MAGNETS_PER_REV == 0) lastRevUs = now;
   }
@@ -117,13 +130,12 @@ static void loadPrefs() {
   cal.wheel_circ_mm    = prefs.getInt   ("circ_mm",    cal.wheel_circ_mm);
   cal.gear_ratio       = prefs.getFloat ("ratio",      cal.gear_ratio);
   cal.speed_res_factor = prefs.getFloat ("srf",        cal.speed_res_factor);
-  cal.torque_min_nm    = prefs.getFloat ("tmin",       cal.torque_min_nm);
-  cal.torque_max_nm    = prefs.getFloat ("tmax",       cal.torque_max_nm);
-  cal.hyst_pct         = prefs.getUChar ("hyst",       cal.hyst_pct);
-  size_t got = prefs.getBytes("lut", cal.lut11, sizeof(cal.lut11));
-  if (got != sizeof(cal.lut11)) {
-    // keep defaults if nothing stored
-  }
+  cal.fly.mass_kg        = prefs.getFloat ("fly_m",      cal.fly.mass_kg);
+  cal.fly.radius_m       = prefs.getFloat ("fly_r",      cal.fly.radius_m);
+  cal.fly.inertia_factor = prefs.getFloat ("fly_k",      cal.fly.inertia_factor);
+  cal.fly.ratio          = prefs.getFloat ("fly_g",      cal.fly.ratio);
+  defaultBrake(cal.brake);
+  if (prefs.getBytes("brake", &cal.brake, sizeof(cal.brake)) != sizeof(cal.brake)) defaultBrake(cal.brake);
   prefs.end();
 }
 
@@ -137,11 +149,22 @@ static void savePrefs() {
   prefs.putInt   ("circ_mm",    cal.wheel_circ_mm);
   prefs.putFloat ("ratio",      cal.gear_ratio);
   prefs.putFloat ("srf",        cal.speed_res_factor);
-  prefs.putFloat ("tmin",       cal.torque_min_nm);
-  prefs.putFloat ("tmax",       cal.torque_max_nm);
-  prefs.putUChar ("hyst",       cal.hyst_pct);
-  prefs.putBytes ("lut",        cal.lut11, sizeof(cal.lut11));
+  prefs.putFloat ("fly_m",      cal.fly.mass_kg);
+  prefs.putFloat ("fly_r",      cal.fly.radius_m);
+  prefs.putFloat ("fly_k",      cal.fly.inertia_factor);
+  prefs.putFloat ("fly_g",      cal.fly.ratio);
+  prefs.putBytes ("brake",      &cal.brake, sizeof(cal.brake));
   prefs.end();
+}
+
+static void printPowerModel() {
+  Serial.printf("[FLY] mass=%.2f kg | diameter=%.1f cm | inertia factor=%.2f | ratio=%.2f -> I at crank=%.3f kg*m^2\n",
+      cal.fly.mass_kg, cal.fly.radius_m * 200.0f, cal.fly.inertia_factor, cal.fly.ratio, power::crankInertia(cal.fly));
+  Serial.println("[BRAKE] res%  friction Nm  magnetic Nm*s/rad  (crank torque = friction + magnetic * omega)");
+  for (int i = 0; i < power::kLutPoints; ++i) {
+    Serial.printf("        %3d%%  %10.2f  %17.3f  %s\n", i * 10, cal.brake.friction_nm[i], cal.brake.magnetic_nms[i],
+        cal.brake.measured[i] ? "measured" : "default");
+  }
 }
 
 static void printCalibration() {
@@ -150,13 +173,7 @@ static void printCalibration() {
       cal.invert ? "true":"false", cal.deadzone_pct);
   Serial.printf("[CFG] wheel=%d mm | ratio=%.2f | speed_res_factor=%.2f\n",
       cal.wheel_circ_mm, cal.gear_ratio, cal.speed_res_factor);
-  Serial.printf("[PWR] torque_min=%.2f Nm | torque_max=%.2f Nm | hyst=%u%%\n",
-      cal.torque_min_nm, cal.torque_max_nm, cal.hyst_pct);
-  Serial.print  ("[LUT] idx:   0  1  2  3  4  5  6  7  8  9 10\n");
-  Serial.print  ("      r% :   0 10 20 30 40 50 60 70 80 90 100\n");
-  Serial.print  ("      val:  ");
-  for (int i=0;i<11;i++){ Serial.printf("%3u", cal.lut11[i]); if(i<10)Serial.print(' '); }
-  Serial.println("  (0..100 torque%)");
+  printPowerModel();
 }
 
 /* Map raw ADC -> 0..100% (anchor 0% at ENGAGE, 100% at HIGH; auto-invert) */
@@ -176,48 +193,7 @@ static float mapADCtoPercent(int raw) {
   return x * 100.0f; // percent
 }
 
-/* LUT interpolation: x in 0..100 → y in 0..100  (linear between 10% steps) */
-static float lutInterp(const uint8_t* lut11, float x_pct) {
-  if (x_pct <= 0.0f) return lut11[0];
-  if (x_pct >= 100.0f) return lut11[10];
-  float pos = x_pct / 10.0f;              // 0..10
-  int   i   = (int)floorf(pos);           // 0..9
-  float f   = pos - i;                    // 0..1
-  float y0  = lut11[i];
-  float y1  = lut11[i+1];
-  return y0 + (y1 - y0) * f;
-}
-
 /* ===================== Cadence / Resistance / Speed / Power ===================== */
-void updateCadence() {
-  static int64_t lastSeenPulseUs = 0;
-
-  noInterrupts();
-  uint32_t intervalUs = lastValidIntervalUs;
-  int64_t  pulseUs    = lastPulseUs;
-  interrupts();
-
-  if (intervalUs > 0 && pulseUs != 0 && pulseUs != lastSeenPulseUs) {
-    lastSeenPulseUs = pulseUs;
-
-    // CRANK RPM (magnet on crank; MAGNETS_PER_REV pulses per crank rev)
-    float crankRevPerSec = 1e6f / (float(intervalUs) * MAGNETS_PER_REV);
-    float rpm = crankRevPerSec * 60.0f;
-
-    if (rpm >= CADENCE_MIN && rpm <= CADENCE_MAX) {
-      cadence_rpm = ema(cadence_rpm, rpm, 0.35f);
-    }
-  }
-
-  // Decay if no pulses for ~3s
-  if (esp_timer_get_time() - pulseUs > 3000000LL) {
-    if (cadence_rpm > 0.0f) {
-      cadence_rpm *= 0.95f;
-      if (cadence_rpm < CADENCE_MIN) cadence_rpm = 0.0f;
-    }
-  }
-}
-
 void updateResistance() {
   static bool  adcInit = false;
   static float resEMA  = 0.0f;
@@ -241,39 +217,114 @@ static inline float speedPerCadence_kmh() {
   return ratio_eff * (cal.wheel_circ_mm * 60.0f / 1e6f);
 }
 
-// hysteresis helper for LUT input
-static int last_res_for_hyst = 0;
+/* ===================== Spin-down calibration ===================== */
+// Measures the brake at the current knob position: spin up past
+// SPINDOWN_ARM_RPM, take your feet off and let the fixed-gear flywheel coast
+// to a stop. The deceleration curve gives friction and magnetic torque.
+enum class SpindownState { Idle, Armed, Recording };
+static SpindownState spindownState = SpindownState::Idle;
+static const float SPINDOWN_ARM_RPM = 80.0f;
+static const int SPINDOWN_MAX = 240;
+static double spindownT[SPINDOWN_MAX];
+static float spindownW[SPINDOWN_MAX];
+static int spindownN = 0;
+static int spindownResistance = 0;
+static uint32_t spindownStartMs = 0;
 
-static inline float torqueFromResistance_Nm() {
-  // Apply small hysteresis by shifting input depending on trend
-  int r = resistance_pct;
-  bool rising = (r >= last_res_for_hyst);
-  last_res_for_hyst = r;
+static void startSpindown() {
+  spindownState = SpindownState::Armed;
+  spindownN = 0;
+  spindownStartMs = millis();
+  Serial.println("\n=== Spin-down ===");
+  Serial.printf("Knob at %d%%. Pedal up past %.0f rpm, then take your feet off the pedals\n", resistance_pct, SPINDOWN_ARM_RPM);
+  Serial.println("and let them coast to a stop. Keep clear of the spinning cranks. Type 'cancel' to abort.");
+}
 
-  float shift = cal.hyst_pct;                 // percent points
-  float r_eff = r + (rising ? +shift*0.5f : -shift*0.5f);
-  if (r_eff < 0.0f) r_eff = 0.0f;
-  if (r_eff > 100.0f) r_eff = 100.0f;
+static void finishSpindown() {
+  spindownState = SpindownState::Idle;
+  // Skip the first revolution after the peak: the rider may still be easing off.
+  int peak = 0;
+  for (int i = 1; i < spindownN; ++i) if (spindownW[i] > spindownW[peak]) peak = i;
+  int from = peak + MAGNETS_PER_REV;
+  power::SpindownFit fit = from < spindownN
+      ? power::fitSpindown(spindownT + from, spindownW + from, spindownN - from, 20.0f * power::kTwoPi / 60.0f, MAGNETS_PER_REV)
+      : power::SpindownFit{};
+  if (!fit.ok || fit.r2 < 0.9f) {
+    Serial.printf("Spin-down not usable (%d points, r2=%.3f). Spin faster before letting go and keep your feet off.\n",
+        fit.points, fit.r2);
+    return;
+  }
+  if (abs(resistance_pct - spindownResistance) > 5) {
+    Serial.printf("The knob moved during the spin-down (%d%% -> %d%%). Try again without touching it.\n",
+        spindownResistance, resistance_pct);
+    return;
+  }
+  float inertia = power::crankInertia(cal.fly);
+  float friction = fmaxf(0.0f, inertia * fit.decel_const);
+  float magnetic = fmaxf(0.0f, inertia * fit.decel_per_omega);
+  int idx = (spindownResistance + 5) / 10;
+  if (idx > power::kLutPoints - 1) idx = power::kLutPoints - 1;
+  cal.brake.friction_nm[idx] = friction;
+  cal.brake.magnetic_nms[idx] = magnetic;
+  cal.brake.measured[idx] = true;
+  savePrefs();
+  float w90 = 90.0f * power::kTwoPi / 60.0f;
+  Serial.printf("Knob %d%% (stored at %d%%): friction %.2f Nm + magnetic %.3f Nm*s/rad (%d points, r2=%.3f)\n",
+      spindownResistance, idx * 10, friction, magnetic, fit.points, fit.r2);
+  Serial.printf("  -> holding 90 rpm here takes %.0f W. Repeat at other knob positions.\n", (friction + magnetic * w90) * w90);
+  printPowerModel();
+}
 
-  // LUT gives torque factor% (0..100)
-  float tf_pct = lutInterp(cal.lut11, r_eff);
-  float tf = tf_pct / 100.0f;                 // 0..1
+static void onSpeedSample() {
+  if (spindownState == SpindownState::Armed && powerEstimator.rpm() >= SPINDOWN_ARM_RPM) {
+    spindownState = SpindownState::Recording;
+    spindownResistance = resistance_pct;
+    spindownN = 0;
+    Serial.println("Recording. Feet off now and let it coast.");
+  }
+  if (spindownState == SpindownState::Recording && spindownN < SPINDOWN_MAX) {
+    spindownT[spindownN] = powerEstimator.omegaTime();
+    spindownW[spindownN] = powerEstimator.omega();
+    ++spindownN;
+  }
+}
 
-  float T = cal.torque_min_nm + (cal.torque_max_nm - cal.torque_min_nm) * tf;
-  if (T < 0.0f) T = 0.0f;
-  return T;
+static void updateSpindown() {
+  if (spindownState == SpindownState::Idle) return;
+  bool stopped = powerEstimator.rpm() < 15.0f;
+  if (spindownState == SpindownState::Recording && (stopped || spindownN >= SPINDOWN_MAX)) {
+    finishSpindown();
+  } else if (millis() - spindownStartMs > 120000) {
+    spindownState = SpindownState::Idle;
+    Serial.println("Spin-down timed out.");
+  }
+}
+
+/* Feed every new magnet pulse to the power model. */
+void updatePower() {
+  static uint32_t consumed = 0;
+  noInterrupts();
+  uint32_t produced = pulseCount;
+  interrupts();
+  if (produced - consumed > PULSE_RING) consumed = produced - PULSE_RING;  // never expected; drop the oldest
+  while (consumed != produced) {
+    noInterrupts();
+    int64_t us = pulseRing[consumed % PULSE_RING];
+    interrupts();
+    ++consumed;
+    if (powerEstimator.onPulse(us / 1e6, (float)resistance_pct, cal.fly, cal.brake)) onSpeedSample();
+  }
+  powerEstimator.onTick(esp_timer_get_time() / 1e6);
+  float rpm = powerEstimator.cadenceRpm();
+  cadence_rpm = (rpm >= CADENCE_MIN && rpm <= CADENCE_MAX) ? rpm : 0.0f;
+  power_w = cadence_rpm > 0.0f ? powerEstimator.powerW() : 0.0f;
 }
 
 void updateMetrics() {
-  updateCadence();
   updateResistance();
-
+  updatePower();
+  updateSpindown();
   speed_kmh = cadence_rpm * speedPerCadence_kmh();
-
-  // Torque-based power
-  const float omega = (2.0f * (float)M_PI) * (cadence_rpm / 60.0f);
-  const float T = torqueFromResistance_Nm();
-  power_w = T * omega;
 }
 
 /* ===================== BLE: FTMS Indoor Bike Data ===================== */
@@ -397,11 +448,12 @@ void printHelp() {
   Serial.println("  setcirc <mm>        - set wheel circumference in mm (1500..3000), e.g. setcirc 2148");
   Serial.println("  setratio <x>        - set base gear ratio (wheel revs per crank rev), e.g. setratio 2.2");
   Serial.println("  setspeedres <f>     - set resistance→ratio factor 0..1 (0=off). e.g. setspeedres 0.3");
-  Serial.println("  settorque <min> <max> - set torque model in Nm, e.g. settorque 0.5 25");
-  Serial.println("  sethyst <pct>       - set LUT hysteresis shift percent (0..10)");
-  Serial.println("  showlut             - print LUT values (0..10)");
-  Serial.println("  setlut <idx> <val>  - set LUT point idx=0..10 (r% 0,10..100), val=0..100 (torque%)");
-  Serial.println("  resetlut            - restore default LUT curve");
+  Serial.println("  spindown            - measure the brake at the current knob position (see prompts)");
+  Serial.println("  cancel              - abort a spin-down");
+  Serial.println("  showpower           - print flywheel and brake model");
+  Serial.println("  setfly <kg> <diam_cm> <factor> <ratio> - flywheel mass, diameter, inertia factor (0.5 disc .. 1 rim), flywheel revs per crank rev");
+  Serial.println("  setbrake <pct> <friction_Nm> <magnetic_Nms> - set one brake point by hand");
+  Serial.println("  clearpower          - forget all spin-down measurements");
   Serial.println("  help                - show this help");
 }
 
@@ -449,57 +501,31 @@ void handleCommand(const String& cmdLine) {
     } else { Serial.printf("Current speed_res_factor: %.2f\nUsage: setspeedres 0.3\n", cal.speed_res_factor); }
     return;
   }
-  if (cmdLine.startsWith("settorque")) {
-    int sp = cmdLine.indexOf(' ');
-    if (sp > 0) {
-      int sp2 = cmdLine.indexOf(' ', sp+1);
-      if (sp2 > 0) {
-        float tmin = cmdLine.substring(sp+1, sp2).toFloat();
-        float tmax = cmdLine.substring(sp2+1).toFloat();
-        if (tmin < 0.0f) tmin = 0.0f;
-        if (tmax < tmin + 0.5f) tmax = tmin + 0.5f;
-        cal.torque_min_nm = tmin; cal.torque_max_nm = tmax; savePrefs();
-        Serial.printf("Torque model set: Tmin=%.2f Nm, Tmax=%.2f Nm\n", cal.torque_min_nm, cal.torque_max_nm);
-      } else Serial.println("Usage: settorque 0.5 25");
-    } else { Serial.printf("Current torque: Tmin=%.2f Nm, Tmax=%.2f Nm\n", cal.torque_min_nm, cal.torque_max_nm); }
-    return;
-  }
-  if (cmdLine.startsWith("sethyst")) {
-    int sp = cmdLine.indexOf(' ');
-    if (sp > 0) {
-      int h = cmdLine.substring(sp+1).toInt();
-      if (h < 0) h = 0; if (h > 10) h = 10;
-      cal.hyst_pct = (uint8_t)h; savePrefs();
-      Serial.printf("Hysteresis set to %d%%\n", cal.hyst_pct);
-    } else { Serial.printf("Current hysteresis: %u%%\nUsage: sethyst 4\n", cal.hyst_pct); }
-    return;
-  }
-  if (cmdLine.equalsIgnoreCase("showlut")) {
-    printCalibration();
-    return;
-  }
-  if (cmdLine.startsWith("setlut")) {
-    // setlut <idx 0..10> <val 0..100>
-    int sp = cmdLine.indexOf(' ');
-    int sp2 = cmdLine.indexOf(' ', sp+1);
-    if (sp>0 && sp2>sp) {
-      int idx = cmdLine.substring(sp+1, sp2).toInt();
-      int val = cmdLine.substring(sp2+1).toInt();
-      if (idx < 0) idx = 0; if (idx > 10) idx = 10;
-      if (val < 0) val = 0; if (val > 100) val = 100;
-      cal.lut11[idx] = (uint8_t)val;
+  if (cmdLine.equalsIgnoreCase("spindown")) { startSpindown(); return; }
+  if (cmdLine.equalsIgnoreCase("cancel")) { spindownState = SpindownState::Idle; Serial.println("Spin-down cancelled."); return; }
+  if (cmdLine.equalsIgnoreCase("showpower")) { printPowerModel(); return; }
+  if (cmdLine.equalsIgnoreCase("clearpower")) { defaultBrake(cal.brake); savePrefs(); Serial.println("Brake model reset to defaults."); return; }
+  if (cmdLine.startsWith("setfly")) {
+    float m, d, k, g;
+    if (sscanf(cmdLine.c_str(), "setfly %f %f %f %f", &m, &d, &k, &g) == 4 && m > 0 && d > 0 && k > 0 && k <= 1.0f && g > 0) {
+      cal.fly.mass_kg = m; cal.fly.radius_m = d / 200.0f; cal.fly.inertia_factor = k; cal.fly.ratio = g;
       savePrefs();
-      Serial.printf("LUT[%d] = %d saved\n", idx, val);
+      printPowerModel();
     } else {
-      Serial.println("Usage: setlut <idx 0..10> <val 0..100>");
+      Serial.println("Usage: setfly <kg> <diameter_cm> <factor 0.5..1> <ratio>, e.g. setfly 6.5 40 0.8 6.25");
     }
     return;
   }
-  if (cmdLine.equalsIgnoreCase("resetlut")) {
-    uint8_t def[11] = { 0, 0, 2, 6, 12, 24, 45, 65, 80, 92, 100 };
-    memcpy(cal.lut11, def, sizeof(def));
-    savePrefs();
-    Serial.println("LUT reset to default.");
+  if (cmdLine.startsWith("setbrake")) {
+    int pct; float f, mg;
+    if (sscanf(cmdLine.c_str(), "setbrake %d %f %f", &pct, &f, &mg) == 3 && pct >= 0 && pct <= 100 && f >= 0 && mg >= 0) {
+      int idx = (pct + 5) / 10;
+      cal.brake.friction_nm[idx] = f; cal.brake.magnetic_nms[idx] = mg; cal.brake.measured[idx] = true;
+      savePrefs();
+      printPowerModel();
+    } else {
+      Serial.println("Usage: setbrake <pct 0..100> <friction_Nm> <magnetic_Nms>");
+    }
     return;
   }
   if (cmdLine.equalsIgnoreCase("help")) { printHelp(); return; }

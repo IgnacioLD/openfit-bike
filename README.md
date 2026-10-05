@@ -17,7 +17,7 @@ The system consists of two ESP32-based modules that work together to provide com
 **Features**:
 - **Cadence Sensing**: Reed/Hall sensor on crank (2 magnets per revolution)
 - **Resistance Measurement**: Analog resistance knob monitoring via ADC
-- **Power Calculation**: Torque-based power estimation using calibrated LUT
+- **Power Calculation**: Physical model (flywheel inertia + felt-pad friction + magnetic brake), calibrated per knob position with a spin-down
 - **Speed Calculation**: Virtual speed based on gear ratio and wheel circumference
 - **BLE Broadcasting**: FTMS (Fitness Machine Service) protocol for app connectivity
 - **Calibration System**: Interactive 3-point resistance calibration
@@ -27,7 +27,7 @@ The system consists of two ESP32-based modules that work together to provide com
 - Device Name: "LibrePulse Bike"
 - Communication: BLE FTMS Indoor Bike Data (UUID: 0x2AD2)
 - Update Rate: 10Hz sensor broadcasting
-- Power Range: 0.5-25 Nm torque model with customizable LUT
+- BLE CSC (UUID: 0x1816) with exact crank revolution timing
 
 ### 2. Display Module (`/display/`)
 **Hardware**: Adafruit Feather ESP32-S3 TFT  
@@ -102,8 +102,9 @@ The internals module provides a rich command interface:
 - `raw` - Monitor raw ADC values
 - `setcirc <mm>` - Set wheel circumference (1500-3000mm)
 - `setratio <ratio>` - Set gear ratio (0.3-5.0)
-- `settorque <min> <max>` - Configure torque range
-- `setlut <idx> <val>` - Customize power curve
+- `setfly <kg> <diameter_cm> <factor> <ratio>` - Flywheel mass, diameter, inertia factor (0.5 solid disc to ~0.8 rim-weighted) and flywheel revs per crank rev
+- `spindown` - Measure the brake at the current knob position: pedal past 80 rpm, take your feet off, let the cranks coast to a stop
+- `showpower` / `setbrake <pct> <friction_Nm> <magnetic_Nms>` / `clearpower` - Inspect, set by hand or reset the brake model
 - `help` - Show all commands
 
 ## 🔗 Integration Roadmap
@@ -148,7 +149,7 @@ This is a personal project exploring the intersection of hardware, fitness, and 
 
 ## 📝 Technical Notes
 
-- **Power Calculation**: Uses torque-based model with customizable lookup table for realistic power estimation
+- **Power Calculation**: Crank torque = I·α + friction(knob) + magnetic(knob)·ω, with I the flywheel inertia seen at the crank. Spin-downs measure friction and magnetic torque in absolute units; do one at several knob positions (e.g. 0, 30, 60, 90 %). The model lives in `internals/lib/PowerModel` and is unit-tested on the host with `pio test -e native`
 - **Calibration**: 3-point system automatically handles different resistance mechanisms
 - **BLE Protocol**: Standard FTMS ensures compatibility with existing fitness apps
 - **Memory**: All settings persist across power cycles using ESP32 preferences
